@@ -51,6 +51,8 @@ Für eine Marketingagentur ist das Tool besonders wertvoll, weil es:
 - Expandierbare Report-Abschnitte in der UI
 - Download des Reports als Markdown
 - Klare Fehlermeldung, wenn kein OpenAI API-Key konfiguriert ist
+- Debug Log in der Sidebar mit Upload-, Parsing- und OpenAI-Diagnosen
+- Technische Fehlerdetails mit OpenAI-Fehlertyp, HTTP-Status, Request-ID und Modellhinweisen, sofern verfügbar
 - Bonus-Button **Marketing Insights** mit Fokus auf:
   - SEO
   - Google Ads
@@ -159,6 +161,25 @@ streamlit run app.py
 ```
 
 Öffnen Sie danach die lokale Streamlit-URL im Browser, laden Sie eine oder mehrere PDF-Dateien hoch und klicken Sie auf **Analyse starten**.
+
+
+## Fehlerdiagnose und Logging
+
+Wenn die Analyse mit der Meldung fehlschlägt, dass die OpenAI API den Bericht nicht erzeugen konnte, zeigt die App jetzt zusätzliche Diagnoseinformationen an:
+
+- In der Sidebar befindet sich ein **Debug Log** mit den letzten Schritten der aktuellen Sitzung.
+- Direkt unter einer Fehlermeldung erscheint ein Bereich **Technische Fehlerdetails**.
+- Bei OpenAI-Fehlern werden, sofern verfügbar, Fehlertyp, HTTP-Status, OpenAI Request-ID, Modellname und eine gekürzte Provider-Meldung angezeigt.
+- API-Keys und extrahierte PDF-Inhalte werden nicht in der UI-Diagnose ausgegeben.
+- Zusätzlich schreibt die App strukturierte Logs in die Streamlit-Konsole.
+
+Typische Ursachen lassen sich dadurch schneller unterscheiden:
+
+- `AuthenticationError`: API-Key ungültig oder nicht zum Projekt passend.
+- `NotFoundError`: `OPENAI_MODEL` ist falsch geschrieben oder nicht freigeschaltet.
+- `RateLimitError`: Rate Limit, Kontingent oder Billing prüfen.
+- `BadRequestError`: Anfrage ungültig, häufig zu viel extrahierter PDF-Text für das Modell.
+- `APIConnectionError` oder `APITimeoutError`: Netzwerk, Proxy, Firewall oder OpenAI-Erreichbarkeit prüfen.
 
 ## Beispiel-Use-Case
 
