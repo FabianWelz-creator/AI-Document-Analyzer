@@ -11,7 +11,11 @@ from services.pdf_parser import OpenDataLoaderPDFParser, ParsedDocument
 class MarketingReportGenerator:
     """Coordinate parsing, LLM analysis, and insight generation."""
 
-    def __init__(self, parser: OpenDataLoaderPDFParser | None = None, llm_service: OpenAIReportService | None = None) -> None:
+    def __init__(
+        self,
+        parser: OpenDataLoaderPDFParser | None = None,
+        llm_service: OpenAIReportService | None = None,
+    ) -> None:
         self.parser = parser or OpenDataLoaderPDFParser()
         self.llm_service = llm_service or OpenAIReportService()
 

@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from textwrap import dedent
+from typing import Any
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    OpenAI,
+    OpenAIError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from services.pdf_parser import ParsedDocument
+
+LOG = logging.getLogger(__name__)
 
 
 class LLMConfigurationError(RuntimeError):
@@ -17,6 +31,10 @@ class LLMConfigurationError(RuntimeError):
 
 class LLMGenerationError(RuntimeError):
     """Raised when report generation fails."""
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 class OpenAIReportService:
@@ -27,6 +45,11 @@ class OpenAIReportService:
         self.api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
         self.client = OpenAI(api_key=self.api_key) if self.api_key else None
+        LOG.info(
+            "OpenAI report service initialized (configured=%s, model=%s)",
+            self.is_configured,
+            self.model,
+        )
 
     @property
     def is_configured(self) -> bool:
@@ -37,13 +60,20 @@ class OpenAIReportService:
         """Generate the main marketing analysis report."""
         self._ensure_configured()
         prompt = self._build_analysis_prompt(documents)
+        total_characters = sum(len(document.markdown) for document in documents)
+        LOG.info(
+            "Generating marketing report (documents=%s, markdown_chars=%s, prompt_chars=%s, model=%s)",
+            len(documents),
+            total_characters,
+            len(prompt),
+            self.model,
+        )
         return self._complete(prompt)
 
     def generate_marketing_insights(self, report: str) -> str:
         """Rewrite an existing report from a digital marketing agency perspective."""
         self._ensure_configured()
-        prompt = dedent(
-            f"""
+        prompt = dedent(f"""
             Du bist Senior Digital Marketing Consultant in einer Performance-Marketing-Agentur.
             Schreibe den folgenden Analysebericht als praxisnahen Abschnitt "Marketing Insights" um.
 
@@ -60,12 +90,18 @@ class OpenAIReportService:
 
             Bericht:
             {report}
-            """
-        ).strip()
+            """).strip()
+        LOG.info(
+            "Generating marketing insights (report_chars=%s, prompt_chars=%s, model=%s)",
+            len(report),
+            len(prompt),
+            self.model,
+        )
         return self._complete(prompt)
 
     def _ensure_configured(self) -> None:
         if not self.is_configured:
+            LOG.warning("OpenAI request blocked because OPENAI_API_KEY is missing")
             raise LLMConfigurationError("OPENAI_API_KEY ist nicht konfiguriert.")
 
     def _complete(self, prompt: str) -> str:
@@ -86,30 +122,103 @@ class OpenAIReportService:
                 ],
             )
         except OpenAIError as exc:
+            details = self._openai_error_details(exc)
+            LOG.exception("OpenAI API request failed: %s", details)
             raise LLMGenerationError(
-                "Die OpenAI API konnte den Bericht nicht erzeugen. Bitte API-Key, Modell und Netzwerk prüfen."
+                self._openai_user_message(exc), details=details
             ) from exc
 
         content = response.choices[0].message.content if response.choices else None
         if not content:
-            raise LLMGenerationError("Die OpenAI API hat keine Antwort zurückgegeben.")
+            LOG.error("OpenAI API returned an empty response (model=%s)", self.model)
+            raise LLMGenerationError(
+                "Die OpenAI API hat keine Antwort zurückgegeben.",
+                details={
+                    "model": self.model,
+                    "response_choices": (
+                        len(response.choices) if response.choices else 0
+                    ),
+                },
+            )
+
+        usage = getattr(response, "usage", None)
+        if usage:
+            LOG.info(
+                "OpenAI API response received (model=%s, prompt_tokens=%s, completion_tokens=%s, total_tokens=%s)",
+                self.model,
+                getattr(usage, "prompt_tokens", None),
+                getattr(usage, "completion_tokens", None),
+                getattr(usage, "total_tokens", None),
+            )
+        else:
+            LOG.info(
+                "OpenAI API response received (model=%s, usage=unavailable)", self.model
+            )
         return content.strip()
+
+    def _openai_error_details(self, exc: OpenAIError) -> dict[str, Any]:
+        details: dict[str, Any] = {
+            "error_type": type(exc).__name__,
+            "model": self.model,
+            "message": self._truncate(str(exc)),
+        }
+
+        for attribute in ("status_code", "code", "param", "type", "request_id"):
+            value = getattr(exc, attribute, None)
+            if value is not None:
+                details[attribute] = value
+
+        response = getattr(exc, "response", None)
+        if response is not None:
+            details["http_status_code"] = getattr(response, "status_code", None)
+            details["http_headers_request_id"] = getattr(response, "headers", {}).get(
+                "x-request-id"
+            )
+
+        return {key: value for key, value in details.items() if value not in (None, "")}
+
+    @staticmethod
+    def _truncate(value: str, max_length: int = 2_000) -> str:
+        """Keep provider diagnostics readable and avoid dumping very large messages."""
+        if len(value) <= max_length:
+            return value
+        return f"{value[:max_length]}... [gekürzt]"
+
+    @staticmethod
+    def _openai_user_message(exc: OpenAIError) -> str:
+        if isinstance(exc, AuthenticationError):
+            return "OpenAI hat den API-Key abgelehnt. Bitte OPENAI_API_KEY prüfen oder neu erstellen."
+        if isinstance(exc, PermissionDeniedError):
+            return "OpenAI verweigert den Zugriff. Bitte Projekt-/Key-Berechtigungen und Modellfreigabe prüfen."
+        if isinstance(exc, NotFoundError):
+            return "Das konfigurierte OpenAI-Modell wurde nicht gefunden. Bitte OPENAI_MODEL prüfen."
+        if isinstance(exc, RateLimitError):
+            return "OpenAI Rate Limit oder Kontingent erreicht. Bitte Limits, Billing und späteren Retry prüfen."
+        if isinstance(exc, BadRequestError):
+            return "OpenAI hat die Anfrage abgelehnt. Häufige Ursache: zu viel PDF-Text für das Modell oder ungültige Anfrage."
+        if isinstance(exc, (APIConnectionError, APITimeoutError)):
+            return "Die OpenAI API ist aktuell nicht erreichbar oder hat zu lange gebraucht. Bitte Netzwerk, Proxy/Firewall und Status prüfen."
+        return "Die OpenAI API konnte den Bericht nicht erzeugen. Details stehen im technischen Fehlerprotokoll."
 
     @staticmethod
     def _build_analysis_prompt(documents: list[ParsedDocument]) -> str:
         multiple_documents = len(documents) > 1
-        comparison_sections = """
+        comparison_sections = (
+            """
         - Similarities
         - Differences
         - Contradictions
-        """ if multiple_documents else ""
-
-        document_blocks = "\n\n".join(
-            f"## Dokument: {document.file_name}\n\n{document.markdown}" for document in documents
+        """
+            if multiple_documents
+            else ""
         )
 
-        return dedent(
-            f"""
+        document_blocks = "\n\n".join(
+            f"## Dokument: {document.file_name}\n\n{document.markdown}"
+            for document in documents
+        )
+
+        return dedent(f"""
             Analysiere die folgenden PDF-Inhalte aus Marketing-Sicht und erstelle einen strukturierten Bericht.
             Die PDF-Inhalte wurden bereits mit OpenDataLoader PDF in Markdown umgewandelt.
 
@@ -131,5 +240,4 @@ class OpenAIReportService:
 
             Dokumentinhalte:
             {document_blocks}
-            """
-        ).strip()
+            """).strip()

@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import logging
+import traceback
+from typing import Any, BinaryIO
+
 import streamlit as st
 
 from services.llm_service import LLMConfigurationError, LLMGenerationError
-from services.pdf_parser import PDFParsingError
+from services.pdf_parser import PDFParsingError, ParsedDocument
 from services.report_generator import MarketingReportGenerator
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+LOG = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="AI Marketing Document Analyzer",
@@ -30,6 +40,54 @@ SECTION_TITLES = [
 ]
 
 
+MAX_DEBUG_EVENTS = 40
+
+
+def initialize_session_state() -> None:
+    """Initialize Streamlit session keys used by the app."""
+    if "report" not in st.session_state:
+        st.session_state.report = ""
+    if "insights" not in st.session_state:
+        st.session_state.insights = ""
+    if "debug_events" not in st.session_state:
+        st.session_state.debug_events = []
+
+
+def add_debug_event(
+    level: str, message: str, details: dict[str, Any] | None = None
+) -> None:
+    """Store a compact, user-visible diagnostic event for the current session."""
+    event = {
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "level": level.upper(),
+        "message": message,
+        "details": details or {},
+    }
+    st.session_state.debug_events.append(event)
+    st.session_state.debug_events = st.session_state.debug_events[-MAX_DEBUG_EVENTS:]
+
+
+def uploaded_file_details(uploaded_files: list[BinaryIO]) -> list[dict[str, Any]]:
+    """Return safe diagnostics for uploaded files without logging file contents."""
+    details = []
+    for uploaded_file in uploaded_files:
+        size = getattr(uploaded_file, "size", None)
+        if size is None and hasattr(uploaded_file, "getbuffer"):
+            size = len(uploaded_file.getbuffer())
+        details.append(
+            {"name": getattr(uploaded_file, "name", "uploaded.pdf"), "bytes": size}
+        )
+    return details
+
+
+def parsed_document_details(documents: list[ParsedDocument]) -> list[dict[str, Any]]:
+    """Return safe diagnostics for parsed documents without logging extracted text."""
+    return [
+        {"name": document.file_name, "markdown_chars": len(document.markdown)}
+        for document in documents
+    ]
+
+
 def show_api_key_warning() -> None:
     """Render a helpful warning when the OpenAI API key is missing."""
     st.warning(
@@ -39,6 +97,52 @@ def show_api_key_warning() -> None:
         "3. Starten Sie die Streamlit App neu.",
         icon="⚠️",
     )
+
+
+def truncate_debug_value(value: str, max_length: int = 2_000) -> str:
+    """Keep UI diagnostics readable without dumping very large exception messages."""
+    if len(value) <= max_length:
+        return value
+    return f"{value[:max_length]}... [gekürzt]"
+
+
+def render_error_details(exc: Exception, context: dict[str, Any] | None = None) -> None:
+    """Show actionable error details in the UI and record them in the session log."""
+    details: dict[str, Any] = {
+        "exception_type": type(exc).__name__,
+        "message": truncate_debug_value(str(exc)),
+    }
+    if context:
+        details["context"] = context
+
+    exception_details = getattr(exc, "details", None)
+    if exception_details:
+        details["provider_details"] = exception_details
+
+    if exc.__cause__ is not None:
+        details["root_cause_type"] = type(exc.__cause__).__name__
+        details["root_cause_message"] = truncate_debug_value(str(exc.__cause__))
+
+    add_debug_event("ERROR", truncate_debug_value(str(exc)), details)
+    LOG.exception("Application error: %s", details)
+
+    with st.expander("Technische Fehlerdetails", expanded=True):
+        st.caption("Keine API-Keys oder PDF-Inhalte werden hier angezeigt.")
+        st.json(details)
+        st.code("".join(traceback.format_exception_only(type(exc), exc)).strip())
+
+
+def render_debug_log() -> None:
+    """Render the recent user-visible diagnostic events."""
+    with st.expander("Debug Log", expanded=False):
+        if not st.session_state.debug_events:
+            st.caption("Noch keine Diagnoseereignisse in dieser Sitzung.")
+            return
+
+        for event in reversed(st.session_state.debug_events):
+            st.markdown(f"**{event['time']} · {event['level']}** — {event['message']}")
+            if event["details"]:
+                st.json(event["details"])
 
 
 def split_report_sections(report: str) -> dict[str, str]:
@@ -55,7 +159,11 @@ def split_report_sections(report: str) -> dict[str, str]:
             continue
         sections.setdefault(current_title, []).append(line)
 
-    return {title: "\n".join(content).strip() for title, content in sections.items() if "\n".join(content).strip()}
+    return {
+        title: "\n".join(content).strip()
+        for title, content in sections.items()
+        if "\n".join(content).strip()
+    }
 
 
 def render_report(report: str) -> None:
@@ -69,8 +177,12 @@ def render_report(report: str) -> None:
 
 def main() -> None:
     """Run the Streamlit application."""
+    initialize_session_state()
+
     st.title("AI Marketing Document Analyzer")
-    st.caption("PDFs hochladen, mit OpenDataLoader PDF in Markdown umwandeln und per OpenAI API analysieren.")
+    st.caption(
+        "PDFs hochladen, mit OpenDataLoader PDF in Markdown umwandeln und per OpenAI API analysieren."
+    )
 
     generator = MarketingReportGenerator()
 
@@ -92,6 +204,8 @@ def main() -> None:
             "- Recommended Actions\n"
             "- Questions for the Customer"
         )
+        st.divider()
+        render_debug_log()
 
     uploaded_files = st.file_uploader(
         "PDF-Dateien per Drag-and-drop hochladen",
@@ -102,52 +216,104 @@ def main() -> None:
 
     col_analyze, col_insights = st.columns([1, 1])
     with col_analyze:
-        analyze_clicked = st.button("Analyse starten", type="primary", use_container_width=True)
+        analyze_clicked = st.button(
+            "Analyse starten", type="primary", use_container_width=True
+        )
     with col_insights:
         insights_clicked = st.button("Marketing Insights", use_container_width=True)
-
-    if "report" not in st.session_state:
-        st.session_state.report = ""
-    if "insights" not in st.session_state:
-        st.session_state.insights = ""
 
     if analyze_clicked:
         if not uploaded_files:
             st.error("Bitte laden Sie mindestens eine PDF-Datei hoch.", icon="🚫")
+            add_debug_event("ERROR", "Analyse ohne Dateien gestartet")
         elif not generator.llm_service.is_configured:
             show_api_key_warning()
+            add_debug_event("ERROR", "Analyse ohne OPENAI_API_KEY gestartet")
         else:
+            context = {
+                "model": generator.llm_service.model,
+                "files": uploaded_file_details(uploaded_files),
+            }
             try:
-                progress = st.progress(0, text="PDFs werden vorbereitet...")
-                progress.progress(25, text="PDFs werden mit OpenDataLoader PDF in Markdown konvertiert...")
-                documents = generator.parse_documents(uploaded_files)
+                LOG.info("Analysis started: %s", context)
+                add_debug_event("INFO", "Analyse gestartet", context)
 
-                progress.progress(60, text="Markdown-Inhalte werden an die OpenAI API gesendet...")
+                progress = st.progress(0, text="PDFs werden vorbereitet...")
+                progress.progress(
+                    25,
+                    text="PDFs werden mit OpenDataLoader PDF in Markdown konvertiert...",
+                )
+                documents = generator.parse_documents(uploaded_files)
+                context["documents"] = parsed_document_details(documents)
+                add_debug_event(
+                    "INFO",
+                    "PDFs erfolgreich in Markdown konvertiert",
+                    {"documents": context["documents"]},
+                )
+
+                progress.progress(
+                    60, text="Markdown-Inhalte werden an die OpenAI API gesendet..."
+                )
                 report = generator.generate_report(documents)
 
                 progress.progress(100, text="Analyse abgeschlossen.")
                 st.session_state.report = report
                 st.session_state.insights = ""
+                add_debug_event(
+                    "INFO",
+                    "Marketing-Analyse erfolgreich erstellt",
+                    {"report_chars": len(report)},
+                )
                 st.success("Marketing-Analyse wurde erfolgreich erstellt.", icon="✅")
             except (PDFParsingError, LLMConfigurationError, LLMGenerationError) as exc:
                 st.error(str(exc), icon="🚫")
-            except Exception as exc:  # Last-resort UI guard for unexpected runtime errors.
+                render_error_details(exc, context)
+            except (
+                Exception
+            ) as exc:  # Last-resort UI guard for unexpected runtime errors.
                 st.error(f"Unerwarteter Fehler: {exc}", icon="🚫")
+                render_error_details(exc, context)
 
     if insights_clicked:
         if not st.session_state.report:
             st.error("Bitte erstellen Sie zuerst einen Analysebericht.", icon="🚫")
+            add_debug_event("ERROR", "Marketing Insights ohne Analysebericht gestartet")
         elif not generator.llm_service.is_configured:
             show_api_key_warning()
+            add_debug_event("ERROR", "Marketing Insights ohne OPENAI_API_KEY gestartet")
         else:
+            context = {
+                "model": generator.llm_service.model,
+                "report_chars": len(st.session_state.report),
+            }
             try:
-                with st.spinner("Marketing Insights werden aus Agenturperspektive erstellt..."):
-                    st.session_state.insights = generator.generate_marketing_insights(st.session_state.report)
+                LOG.info("Marketing insights generation started: %s", context)
+                add_debug_event("INFO", "Marketing Insights gestartet", context)
+                with st.spinner(
+                    "Marketing Insights werden aus Agenturperspektive erstellt..."
+                ):
+                    st.session_state.insights = generator.generate_marketing_insights(
+                        st.session_state.report
+                    )
+                add_debug_event(
+                    "INFO",
+                    "Marketing Insights erfolgreich erstellt",
+                    {"insights_chars": len(st.session_state.insights)},
+                )
                 st.success("Marketing Insights wurden erstellt.", icon="✅")
             except (LLMConfigurationError, LLMGenerationError) as exc:
                 st.error(str(exc), icon="🚫")
-            except Exception as exc:  # Last-resort UI guard for unexpected runtime errors.
+                render_error_details(exc, context)
+            except (
+                Exception
+            ) as exc:  # Last-resort UI guard for unexpected runtime errors.
                 st.error(f"Unerwarteter Fehler: {exc}", icon="🚫")
+                render_error_details(exc, context)
+
+    if st.session_state.debug_events:
+        st.divider()
+        st.subheader("Diagnose der aktuellen Sitzung")
+        render_debug_log()
 
     if st.session_state.report:
         st.divider()
