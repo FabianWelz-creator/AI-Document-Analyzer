@@ -1,0 +1,28 @@
+# Environment variables and secrets
+.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Streamlit and local runtime files
+.streamlit/secrets.toml
+
+# Temporary upload/output files
+tmp/
+temp/
+uploads/
+*.tmp
+*.temp
+.DS_Store
