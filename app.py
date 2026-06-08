@@ -48,6 +48,15 @@ SECTION_TITLES = [
 
 MAX_DEBUG_EVENTS = 40
 
+COMPACT_REPORT_INSTRUCTIONS = (
+    "Erstelle einen kompakten Kontext-Ersatz: priorisiere die wichtigsten "
+    "Erkenntnisse, vermeide Wiederholungen und halte jeden Abschnitt knapp."
+)
+DETAILED_REPORT_INSTRUCTIONS = (
+    "Erstelle eine ausführlichere Analyse mit zusätzlichen Begründungen, Beispielen "
+    "und konkreteren Handlungsschritten. Vermeide trotzdem unnötige Wiederholungen."
+)
+
 
 def initialize_session_state() -> None:
     """Initialize Streamlit session keys used by the app."""
@@ -65,6 +74,8 @@ def initialize_session_state() -> None:
         st.session_state.analysis_prompt_template = DEFAULT_ANALYSIS_PROMPT_TEMPLATE
     if "insights_prompt_template" not in st.session_state:
         st.session_state.insights_prompt_template = DEFAULT_INSIGHTS_PROMPT_TEMPLATE
+    if "detailed_report" not in st.session_state:
+        st.session_state.detailed_report = False
 
 
 def add_debug_event(
@@ -102,26 +113,88 @@ def parsed_document_details(documents: list[ParsedDocument]) -> list[dict[str, A
     ]
 
 
-def estimate_tokens(text: str) -> int:
-    """Estimate token counts for UI-only savings metrics.
+MODEL_TOKEN_ESTIMATION_PROFILES = (
+    {
+        "prefixes": ("gpt-5", "gpt-4.1", "gpt-4o", "o1", "o3", "o4"),
+        "name": "o200k/GPT-4o- und GPT-5-Profil",
+        "chars_per_token": 3.8,
+    },
+    {
+        "prefixes": ("gpt-4", "gpt-3.5"),
+        "name": "cl100k/GPT-3.5- und GPT-4-Profil",
+        "chars_per_token": 3.4,
+    },
+)
+DEFAULT_TOKEN_ESTIMATION_PROFILE = {
+    "prefixes": (),
+    "name": "Standard-Schätzung",
+    "chars_per_token": 4.0,
+}
 
-    OpenAI usage values are only available after an API call. For the user-facing
-    overview, use a transparent approximation of roughly four characters per token.
+
+def token_estimation_profile(model: str | None = None) -> dict[str, Any]:
+    """Return the best available heuristic token profile for an OpenAI model."""
+    normalized_model = (model or "").strip().lower().replace("_", "-")
+    for profile in MODEL_TOKEN_ESTIMATION_PROFILES:
+        if any(normalized_model.startswith(prefix) for prefix in profile["prefixes"]):
+            return profile
+    return DEFAULT_TOKEN_ESTIMATION_PROFILE
+
+
+def estimate_tokens(text: str, model: str | None = None) -> int:
+    """Estimate token counts with a model-aware, transparent heuristic.
+
+    The OpenAI API can return exact usage values after a request. For text that was
+    not directly reported by the API, use a model-family profile instead of one
+    global four-characters-per-token rule.
     """
-    return max(1, round(len(text) / 4)) if text else 0
+    if not text:
+        return 0
+    profile = token_estimation_profile(model)
+    chars_per_token = profile["chars_per_token"]
+    return max(1, round(len(text) / chars_per_token))
 
 
-def calculate_savings_metrics(original_text: str, used_context: str) -> dict[str, Any]:
-    """Calculate approximate token reduction metrics for compact UI cards."""
-    original_tokens = estimate_tokens(original_text)
-    used_tokens = estimate_tokens(used_context)
-    saved_tokens = max(original_tokens - used_tokens, 0)
-    savings_percent = (saved_tokens / original_tokens * 100) if original_tokens else 0
+def calculate_savings_metrics(
+    original_text: str,
+    used_context: str,
+    model: str | None = None,
+    used_context_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Calculate token reduction metrics for compact UI cards.
+
+    When OpenAI returns exact completion tokens, use them for the generated
+    context. Otherwise, fall back to a model-aware estimate. A generated report can
+    be longer than the extracted source text for short PDFs or verbose model
+    outputs, so keep that negative result visible instead of clamping it to a
+    misleading 0% savings value.
+    """
+    profile = token_estimation_profile(model)
+    original_tokens = estimate_tokens(original_text, model)
+    has_exact_used_context_tokens = used_context_tokens is not None
+    used_tokens = (
+        used_context_tokens
+        if has_exact_used_context_tokens
+        else estimate_tokens(used_context, model)
+    )
+    token_delta = original_tokens - used_tokens
+    savings_percent = (token_delta / original_tokens * 100) if original_tokens else 0
     return {
         "original_tokens": original_tokens,
         "used_context_tokens": used_tokens,
-        "saved_tokens": saved_tokens,
+        "token_delta": token_delta,
+        "saved_tokens": max(token_delta, 0),
         "savings_percent": savings_percent,
+        "has_savings": token_delta > 0,
+        "estimation_model": model or "unbekannt",
+        "estimation_profile": profile["name"],
+        "chars_per_token": profile["chars_per_token"],
+        "original_token_source": "model_profile_estimate",
+        "used_context_token_source": (
+            "api_completion_tokens"
+            if has_exact_used_context_tokens
+            else "model_profile_estimate"
+        ),
     }
 
 
@@ -136,9 +209,19 @@ def render_token_savings(metrics: dict[str, Any]) -> None:
         return
 
     st.subheader("Token-Ersparnis")
+    profile_name = metrics.get("estimation_profile", "Standard-Schätzung")
+    chars_per_token = metrics.get("chars_per_token", 4.0)
+    used_context_source = metrics.get("used_context_token_source")
+    used_context_label = (
+        "exakter API-Wert für Antworttokens"
+        if used_context_source == "api_completion_tokens"
+        else "modellbasierte Schätzung"
+    )
     st.caption(
-        "Schätzung auf Basis von ca. 4 Zeichen pro Token: Der extrahierte Originaltext "
-        "wird durch den erzeugten Bericht als kompakter Kontext ersetzt."
+        f"Token-Berechnung: Originaltext über {profile_name} "
+        f"(~{str(chars_per_token).replace('.', ',')} Zeichen/Token), "
+        f"verwendeter Kontext über {used_context_label}. Ist der Bericht länger, "
+        "wird der Mehrverbrauch sichtbar ausgewiesen."
     )
     col_original, col_context, col_savings = st.columns(3)
     col_original.metric(
@@ -148,12 +231,73 @@ def render_token_savings(metrics: dict[str, Any]) -> None:
         "Verwendeter Kontext",
         f"{format_number(metrics['used_context_tokens'])} Tokens",
     )
-    col_savings.metric(
-        "Geschätzte Ersparnis",
-        f"{metrics['savings_percent']:.1f} %".replace(".", ","),
-        delta=f"-{format_number(metrics['saved_tokens'])} Tokens",
+    token_delta = metrics.get("token_delta", metrics["saved_tokens"])
+    if token_delta >= 0:
+        col_savings.metric(
+            "Geschätzte Ersparnis",
+            f"{metrics['savings_percent']:.1f} %".replace(".", ","),
+            delta=f"-{format_number(token_delta)} Tokens",
+        )
+        st.progress(min(metrics["savings_percent"] / 100, 1.0))
+    else:
+        col_savings.metric(
+            "Kontext-Mehrverbrauch",
+            f"+{abs(metrics['savings_percent']):.1f} %".replace(".", ","),
+            delta=f"+{format_number(abs(token_delta))} Tokens",
+            delta_color="inverse",
+        )
+        st.warning(
+            "Der erzeugte Bericht ist länger als der extrahierte Originaltext. "
+            "Für diesen Lauf entsteht daher keine Token-Ersparnis.",
+            icon="⚠️",
+        )
+        st.progress(0.0)
+
+
+def apply_analysis_detail_preference(
+    analysis_prompt_template: str, detailed_report: bool
+) -> str:
+    """Append the selected report detail level to the editable analysis prompt."""
+    instruction = (
+        DETAILED_REPORT_INSTRUCTIONS
+        if detailed_report
+        else COMPACT_REPORT_INSTRUCTIONS
     )
-    st.progress(min(metrics["savings_percent"] / 100, 1.0))
+    return (
+        f"{analysis_prompt_template.strip()}\n\n"
+        "Ausgabeumfang:\n"
+        f"- {instruction}"
+    )
+
+
+def render_response_detail_toggle() -> None:
+    """Render the report verbosity switch used for analysis generation."""
+    st.session_state.detailed_report = st.toggle(
+        "Ausführliche Antwort",
+        value=st.session_state.detailed_report,
+        help=(
+            "Aus: kompakter Bericht für möglichst geringe Kontextkosten. "
+            "Ein: ausführlicherer Bericht mit mehr Begründungen, der entsprechend mehr Tokens nutzen kann."
+        ),
+    )
+    if st.session_state.detailed_report:
+        st.caption(
+            "Ausführlicher Modus aktiv: Der Bericht kann länger werden und dadurch mehr Kontext/Tokens verbrauchen."
+        )
+    else:
+        st.caption("Kompakter Modus aktiv: Der Bericht wird möglichst kurz gehalten.")
+
+    with st.expander("Warum kann der Verbrauch je Modell schwanken?", expanded=False):
+        st.markdown(
+            "- Wenn die OpenAI API Antworttokens zurückliefert, nutzt die App diesen exakten Wert "
+            "für den erzeugten Bericht; sonst fällt sie auf ein Modellprofil zurück.\n"
+            "- Der Originaltext wird vor dem API-Aufruf modellabhängig geschätzt, weil dafür kein "
+            "separater API-Usage-Wert vorliegt.\n"
+            "- Unterschiedliche Modelle formulieren trotz gleicher Aufgabe unterschiedlich ausführlich. "
+            "Ein Modell kann mehr Überschriften, Begründungen oder Wiederholungen erzeugen und dadurch "
+            "einen längeren Kontext liefern.\n"
+            "- Der ausführliche Modus erhöht bewusst die Detailtiefe und kann deshalb mehr Tokens verbrauchen."
+        )
 
 
 def render_prompt_settings() -> None:
@@ -295,6 +439,10 @@ def main() -> None:
             st.success("OpenAI API-Key gefunden.", icon="✅")
 
         st.divider()
+        st.subheader("Antwortumfang")
+        render_response_detail_toggle()
+
+        st.divider()
         render_prompt_settings()
 
         st.divider()
@@ -335,6 +483,9 @@ def main() -> None:
         else:
             context = {
                 "model": generator.llm_service.model,
+                "response_detail": (
+                    "ausführlich" if st.session_state.detailed_report else "kompakt"
+                ),
                 "files": uploaded_file_details(uploaded_files),
             }
             try:
@@ -357,9 +508,13 @@ def main() -> None:
                 progress.progress(
                     60, text="Markdown-Inhalte werden an die OpenAI API gesendet..."
                 )
+                effective_analysis_prompt = apply_analysis_detail_preference(
+                    st.session_state.analysis_prompt_template,
+                    st.session_state.detailed_report,
+                )
                 report = generator.generate_report(
                     documents,
-                    analysis_prompt_template=st.session_state.analysis_prompt_template,
+                    analysis_prompt_template=effective_analysis_prompt,
                     system_prompt=st.session_state.system_prompt,
                 )
 
@@ -367,13 +522,21 @@ def main() -> None:
                 st.session_state.report = report
                 st.session_state.insights = ""
                 original_text = "\n\n".join(document.markdown for document in documents)
+                llm_usage = generator.llm_service.last_usage
                 st.session_state.token_metrics = calculate_savings_metrics(
-                    original_text, report
+                    original_text,
+                    report,
+                    model=generator.llm_service.model,
+                    used_context_tokens=llm_usage.get("completion_tokens"),
                 )
                 add_debug_event(
                     "INFO",
                     "Marketing-Analyse erfolgreich erstellt",
-                    {"report_chars": len(report)},
+                    {
+                        "report_chars": len(report),
+                        "usage": generator.llm_service.last_usage,
+                        "token_metrics": st.session_state.token_metrics,
+                    },
                 )
                 st.success("Marketing-Analyse wurde erfolgreich erstellt.", icon="✅")
             except (PDFParsingError, LLMConfigurationError, LLMGenerationError) as exc:

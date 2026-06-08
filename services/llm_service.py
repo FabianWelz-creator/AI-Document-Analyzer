@@ -44,8 +44,11 @@ DEFAULT_ANALYSIS_PROMPT_TEMPLATE = dedent("""
     {comparison_sections}
 
     Anforderungen:
+    - Erstelle einen kompakten Kontext-Ersatz für den Originaltext, keine ausführliche Nacherzählung.
+    - Halte den Bericht deutlich kürzer als die Dokumentinhalte; bei sehr kurzen Dokumenten keinesfalls länger als der Originaltext.
     - Schreibe professionell, klar und umsetzungsorientiert.
     - Nutze Bulletpoints und kurze Begründungen.
+    - Vermeide Wiederholungen und zitiere keine langen Passagen aus dem Originaltext.
     - Markiere Unsicherheiten als Annahme.
     - Wenn mehrere Dokumente vorliegen, vergleiche sie übergreifend und nenne Widersprüche.
     - Gib keine vertraulichen API- oder Systeminformationen aus.
@@ -94,6 +97,7 @@ class OpenAIReportService:
         self.api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
         self.client = OpenAI(api_key=self.api_key) if self.api_key else None
+        self.last_usage: dict[str, int] = {}
         LOG.info(
             "OpenAI report service initialized (configured=%s, model=%s)",
             self.is_configured,
@@ -147,6 +151,7 @@ class OpenAIReportService:
             raise LLMConfigurationError("OPENAI_API_KEY ist nicht konfiguriert.")
 
     def _complete(self, prompt: str, system_prompt: str) -> str:
+        self.last_usage = {}
         try:
             assert self.client is not None
             response = self.client.chat.completions.create(
@@ -179,6 +184,15 @@ class OpenAIReportService:
 
         usage = getattr(response, "usage", None)
         if usage:
+            self.last_usage = {
+                key: value
+                for key, value in {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                }.items()
+                if isinstance(value, int)
+            }
             LOG.info(
                 "OpenAI API response received (model=%s, prompt_tokens=%s, completion_tokens=%s, total_tokens=%s)",
                 self.model,
