@@ -25,6 +25,55 @@ from services.pdf_parser import ParsedDocument
 LOG = logging.getLogger(__name__)
 
 
+DEFAULT_SYSTEM_PROMPT = (
+    "Du erstellst präzise, strukturierte Marketing-Analysen in Markdown. "
+    "Kennzeichne Annahmen klar und erfinde keine Fakten."
+)
+
+DEFAULT_ANALYSIS_PROMPT_TEMPLATE = dedent("""
+    Analysiere die folgenden PDF-Inhalte aus Marketing-Sicht und erstelle einen strukturierten Bericht.
+    Die PDF-Inhalte wurden bereits mit OpenDataLoader PDF in Markdown umgewandelt.
+
+    Der Bericht muss exakt diese Hauptabschnitte enthalten:
+    - Executive Summary
+    - Key Findings
+    - Opportunities
+    - Risks
+    - Recommended Actions
+    - Questions for the Customer
+    {comparison_sections}
+
+    Anforderungen:
+    - Schreibe professionell, klar und umsetzungsorientiert.
+    - Nutze Bulletpoints und kurze Begründungen.
+    - Markiere Unsicherheiten als Annahme.
+    - Wenn mehrere Dokumente vorliegen, vergleiche sie übergreifend und nenne Widersprüche.
+    - Gib keine vertraulichen API- oder Systeminformationen aus.
+
+    Dokumentinhalte:
+    {document_blocks}
+    """).strip()
+
+DEFAULT_INSIGHTS_PROMPT_TEMPLATE = dedent("""
+    Du bist Senior Digital Marketing Consultant in einer Performance-Marketing-Agentur.
+    Schreibe den folgenden Analysebericht als praxisnahen Abschnitt "Marketing Insights" um.
+
+    Hebe explizit Potenziale und konkrete nächste Schritte für diese Bereiche hervor:
+    - SEO
+    - Google Ads
+    - Web Analytics
+    - Conversion Optimization
+    - Content Marketing
+    - Automation potential
+
+    Liefere das Ergebnis in klarem Markdown mit Zwischenüberschriften, priorisierten Empfehlungen
+    und kurzen Begründungen. Beziehe dich nur auf Informationen, die aus dem Bericht ableitbar sind.
+
+    Bericht:
+    {report}
+    """).strip()
+
+
 class LLMConfigurationError(RuntimeError):
     """Raised when the OpenAI API configuration is incomplete."""
 
@@ -56,10 +105,15 @@ class OpenAIReportService:
         """Return whether an API key is available."""
         return bool(self.api_key and self.client)
 
-    def generate_report(self, documents: list[ParsedDocument]) -> str:
+    def generate_report(
+        self,
+        documents: list[ParsedDocument],
+        analysis_prompt_template: str = DEFAULT_ANALYSIS_PROMPT_TEMPLATE,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    ) -> str:
         """Generate the main marketing analysis report."""
         self._ensure_configured()
-        prompt = self._build_analysis_prompt(documents)
+        prompt = self.build_analysis_prompt(documents, analysis_prompt_template)
         total_characters = sum(len(document.markdown) for document in documents)
         LOG.info(
             "Generating marketing report (documents=%s, markdown_chars=%s, prompt_chars=%s, model=%s)",
@@ -68,56 +122,38 @@ class OpenAIReportService:
             len(prompt),
             self.model,
         )
-        return self._complete(prompt)
+        return self._complete(prompt, system_prompt)
 
-    def generate_marketing_insights(self, report: str) -> str:
+    def generate_marketing_insights(
+        self,
+        report: str,
+        insights_prompt_template: str = DEFAULT_INSIGHTS_PROMPT_TEMPLATE,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    ) -> str:
         """Rewrite an existing report from a digital marketing agency perspective."""
         self._ensure_configured()
-        prompt = dedent(f"""
-            Du bist Senior Digital Marketing Consultant in einer Performance-Marketing-Agentur.
-            Schreibe den folgenden Analysebericht als praxisnahen Abschnitt "Marketing Insights" um.
-
-            Hebe explizit Potenziale und konkrete nächste Schritte für diese Bereiche hervor:
-            - SEO
-            - Google Ads
-            - Web Analytics
-            - Conversion Optimization
-            - Content Marketing
-            - Automation potential
-
-            Liefere das Ergebnis in klarem Markdown mit Zwischenüberschriften, priorisierten Empfehlungen
-            und kurzen Begründungen. Beziehe dich nur auf Informationen, die aus dem Bericht ableitbar sind.
-
-            Bericht:
-            {report}
-            """).strip()
+        prompt = self.build_insights_prompt(report, insights_prompt_template)
         LOG.info(
             "Generating marketing insights (report_chars=%s, prompt_chars=%s, model=%s)",
             len(report),
             len(prompt),
             self.model,
         )
-        return self._complete(prompt)
+        return self._complete(prompt, system_prompt)
 
     def _ensure_configured(self) -> None:
         if not self.is_configured:
             LOG.warning("OpenAI request blocked because OPENAI_API_KEY is missing")
             raise LLMConfigurationError("OPENAI_API_KEY ist nicht konfiguriert.")
 
-    def _complete(self, prompt: str) -> str:
+    def _complete(self, prompt: str, system_prompt: str) -> str:
         try:
             assert self.client is not None
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.2,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Du erstellst präzise, strukturierte Marketing-Analysen in Markdown. "
-                            "Kennzeichne Annahmen klar und erfinde keine Fakten."
-                        ),
-                    },
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
                 ],
             )
@@ -201,7 +237,11 @@ class OpenAIReportService:
         return "Die OpenAI API konnte den Bericht nicht erzeugen. Details stehen im technischen Fehlerprotokoll."
 
     @staticmethod
-    def _build_analysis_prompt(documents: list[ParsedDocument]) -> str:
+    def build_analysis_prompt(
+        documents: list[ParsedDocument],
+        analysis_prompt_template: str = DEFAULT_ANALYSIS_PROMPT_TEMPLATE,
+    ) -> str:
+        """Build the editable analysis prompt with document placeholders filled."""
         multiple_documents = len(documents) > 1
         comparison_sections = (
             """
@@ -218,26 +258,15 @@ class OpenAIReportService:
             for document in documents
         )
 
-        return dedent(f"""
-            Analysiere die folgenden PDF-Inhalte aus Marketing-Sicht und erstelle einen strukturierten Bericht.
-            Die PDF-Inhalte wurden bereits mit OpenDataLoader PDF in Markdown umgewandelt.
+        return analysis_prompt_template.format(
+            comparison_sections=comparison_sections,
+            document_blocks=document_blocks,
+        ).strip()
 
-            Der Bericht muss exakt diese Hauptabschnitte enthalten:
-            - Executive Summary
-            - Key Findings
-            - Opportunities
-            - Risks
-            - Recommended Actions
-            - Questions for the Customer
-            {comparison_sections}
-
-            Anforderungen:
-            - Schreibe professionell, klar und umsetzungsorientiert.
-            - Nutze Bulletpoints und kurze Begründungen.
-            - Markiere Unsicherheiten als Annahme.
-            - Wenn mehrere Dokumente vorliegen, vergleiche sie übergreifend und nenne Widersprüche.
-            - Gib keine vertraulichen API- oder Systeminformationen aus.
-
-            Dokumentinhalte:
-            {document_blocks}
-            """).strip()
+    @staticmethod
+    def build_insights_prompt(
+        report: str,
+        insights_prompt_template: str = DEFAULT_INSIGHTS_PROMPT_TEMPLATE,
+    ) -> str:
+        """Build the editable marketing insights prompt with report placeholder filled."""
+        return insights_prompt_template.format(report=report).strip()

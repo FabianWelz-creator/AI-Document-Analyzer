@@ -23,10 +23,25 @@ class MarketingReportGenerator:
         """Parse uploaded PDFs into Markdown documents."""
         return self.parser.parse_uploaded_files(uploaded_files)
 
-    def generate_report(self, documents: list[ParsedDocument]) -> str:
+    def generate_report(
+        self,
+        documents: list[ParsedDocument],
+        analysis_prompt_template: str,
+        system_prompt: str,
+    ) -> str:
         """Generate a structured marketing analysis report."""
-        return self.llm_service.generate_report(documents)
+        return self.llm_service.generate_report(
+            documents,
+            analysis_prompt_template=analysis_prompt_template,
+            system_prompt=system_prompt,
+        )
 
-    def generate_marketing_insights(self, report: str) -> str:
+    def generate_marketing_insights(
+        self, report: str, insights_prompt_template: str, system_prompt: str
+    ) -> str:
         """Generate agency-focused digital marketing insights from a report."""
-        return self.llm_service.generate_marketing_insights(report)
+        return self.llm_service.generate_marketing_insights(
+            report,
+            insights_prompt_template=insights_prompt_template,
+            system_prompt=system_prompt,
+        )

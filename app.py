@@ -9,7 +9,13 @@ from typing import Any, BinaryIO
 
 import streamlit as st
 
-from services.llm_service import LLMConfigurationError, LLMGenerationError
+from services.llm_service import (
+    DEFAULT_ANALYSIS_PROMPT_TEMPLATE,
+    DEFAULT_INSIGHTS_PROMPT_TEMPLATE,
+    DEFAULT_SYSTEM_PROMPT,
+    LLMConfigurationError,
+    LLMGenerationError,
+)
 from services.pdf_parser import PDFParsingError, ParsedDocument
 from services.report_generator import MarketingReportGenerator
 
@@ -51,6 +57,14 @@ def initialize_session_state() -> None:
         st.session_state.insights = ""
     if "debug_events" not in st.session_state:
         st.session_state.debug_events = []
+    if "token_metrics" not in st.session_state:
+        st.session_state.token_metrics = {}
+    if "system_prompt" not in st.session_state:
+        st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
+    if "analysis_prompt_template" not in st.session_state:
+        st.session_state.analysis_prompt_template = DEFAULT_ANALYSIS_PROMPT_TEMPLATE
+    if "insights_prompt_template" not in st.session_state:
+        st.session_state.insights_prompt_template = DEFAULT_INSIGHTS_PROMPT_TEMPLATE
 
 
 def add_debug_event(
@@ -86,6 +100,92 @@ def parsed_document_details(documents: list[ParsedDocument]) -> list[dict[str, A
         {"name": document.file_name, "markdown_chars": len(document.markdown)}
         for document in documents
     ]
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token counts for UI-only savings metrics.
+
+    OpenAI usage values are only available after an API call. For the user-facing
+    overview, use a transparent approximation of roughly four characters per token.
+    """
+    return max(1, round(len(text) / 4)) if text else 0
+
+
+def calculate_savings_metrics(original_text: str, used_context: str) -> dict[str, Any]:
+    """Calculate approximate token reduction metrics for compact UI cards."""
+    original_tokens = estimate_tokens(original_text)
+    used_tokens = estimate_tokens(used_context)
+    saved_tokens = max(original_tokens - used_tokens, 0)
+    savings_percent = (saved_tokens / original_tokens * 100) if original_tokens else 0
+    return {
+        "original_tokens": original_tokens,
+        "used_context_tokens": used_tokens,
+        "saved_tokens": saved_tokens,
+        "savings_percent": savings_percent,
+    }
+
+
+def format_number(value: int) -> str:
+    """Format integers with German thousands separators for Streamlit metrics."""
+    return f"{value:,}".replace(",", ".")
+
+
+def render_token_savings(metrics: dict[str, Any]) -> None:
+    """Visualize the approximate token savings achieved by report condensation."""
+    if not metrics:
+        return
+
+    st.subheader("Token-Ersparnis")
+    st.caption(
+        "Schätzung auf Basis von ca. 4 Zeichen pro Token: Der extrahierte Originaltext "
+        "wird durch den erzeugten Bericht als kompakter Kontext ersetzt."
+    )
+    col_original, col_context, col_savings = st.columns(3)
+    col_original.metric(
+        "Original Text", f"{format_number(metrics['original_tokens'])} Tokens"
+    )
+    col_context.metric(
+        "Verwendeter Kontext",
+        f"{format_number(metrics['used_context_tokens'])} Tokens",
+    )
+    col_savings.metric(
+        "Geschätzte Ersparnis",
+        f"{metrics['savings_percent']:.1f} %".replace(".", ","),
+        delta=f"-{format_number(metrics['saved_tokens'])} Tokens",
+    )
+    st.progress(min(metrics["savings_percent"] / 100, 1.0))
+
+
+def render_prompt_settings() -> None:
+    """Render editable prompt templates for report and insight generation."""
+    with st.expander("Prompt-Einstellungen", expanded=False):
+        st.caption(
+            "Hier können System-Prompt sowie die Vorlagen für den Analysebericht und "
+            "die Marketing Insights angepasst werden. Platzhalter bitte beibehalten."
+        )
+        st.session_state.system_prompt = st.text_area(
+            "System-Prompt",
+            value=st.session_state.system_prompt,
+            height=100,
+            help="Gilt für Analysebericht und Marketing Insights.",
+        )
+        st.session_state.analysis_prompt_template = st.text_area(
+            "Prompt: Strukturierter Marketing-Analysebericht",
+            value=st.session_state.analysis_prompt_template,
+            height=360,
+            help="Pflicht-Platzhalter: {document_blocks}. Optional: {comparison_sections}.",
+        )
+        st.session_state.insights_prompt_template = st.text_area(
+            "Prompt: Marketing Insights",
+            value=st.session_state.insights_prompt_template,
+            height=300,
+            help="Pflicht-Platzhalter: {report}.",
+        )
+        if st.button("Prompts auf Standard zurücksetzen", use_container_width=True):
+            st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
+            st.session_state.analysis_prompt_template = DEFAULT_ANALYSIS_PROMPT_TEMPLATE
+            st.session_state.insights_prompt_template = DEFAULT_INSIGHTS_PROMPT_TEMPLATE
+            st.rerun()
 
 
 def show_api_key_warning() -> None:
@@ -195,6 +295,9 @@ def main() -> None:
             st.success("OpenAI API-Key gefunden.", icon="✅")
 
         st.divider()
+        render_prompt_settings()
+
+        st.divider()
         st.markdown(
             "**Report-Struktur**\n"
             "- Executive Summary\n"
@@ -254,11 +357,19 @@ def main() -> None:
                 progress.progress(
                     60, text="Markdown-Inhalte werden an die OpenAI API gesendet..."
                 )
-                report = generator.generate_report(documents)
+                report = generator.generate_report(
+                    documents,
+                    analysis_prompt_template=st.session_state.analysis_prompt_template,
+                    system_prompt=st.session_state.system_prompt,
+                )
 
                 progress.progress(100, text="Analyse abgeschlossen.")
                 st.session_state.report = report
                 st.session_state.insights = ""
+                original_text = "\n\n".join(document.markdown for document in documents)
+                st.session_state.token_metrics = calculate_savings_metrics(
+                    original_text, report
+                )
                 add_debug_event(
                     "INFO",
                     "Marketing-Analyse erfolgreich erstellt",
@@ -293,7 +404,9 @@ def main() -> None:
                     "Marketing Insights werden aus Agenturperspektive erstellt..."
                 ):
                     st.session_state.insights = generator.generate_marketing_insights(
-                        st.session_state.report
+                        st.session_state.report,
+                        insights_prompt_template=st.session_state.insights_prompt_template,
+                        system_prompt=st.session_state.system_prompt,
                     )
                 add_debug_event(
                     "INFO",
@@ -317,6 +430,8 @@ def main() -> None:
 
     if st.session_state.report:
         st.divider()
+        render_token_savings(st.session_state.token_metrics)
+
         st.subheader("Strukturierter Marketing-Analysebericht")
         render_report(st.session_state.report)
 

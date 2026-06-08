@@ -49,6 +49,8 @@ Für eine Marketingagentur ist das Tool besonders wertvoll, weil es:
   - Differences
   - Contradictions
 - Expandierbare Report-Abschnitte in der UI
+- Visualisierung der geschätzten Token-Ersparnis zwischen extrahiertem Originaltext und verdichtetem Bericht
+- Bearbeitbare Prompt-Einstellungen für System-Prompt, strukturierten Marketing-Analysebericht und Marketing Insights
 - Download des Reports als Markdown
 - Klare Fehlermeldung, wenn kein OpenAI API-Key konfiguriert ist
 - Debug Log in der Sidebar mit Upload-, Parsing- und OpenAI-Diagnosen
